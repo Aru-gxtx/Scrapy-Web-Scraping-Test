@@ -126,8 +126,22 @@ class GoforgreenukSpider(scrapy.Spider):
 
     async def parse_search(self, response):
         page = response.meta.get("playwright_page")
+        page_anchor_urls = set()
         if page:
-            await page.close()
+            try:
+                # Doofinder may render links in dynamic frames not visible in response.css.
+                for frame in page.frames:
+                    try:
+                        hrefs = await frame.eval_on_selector_all(
+                            "a[href]",
+                            "elements => elements.map(e => e.href || e.getAttribute('href') || '').filter(Boolean)",
+                        )
+                    except Exception:
+                        hrefs = []
+                    for href in hrefs or []:
+                        page_anchor_urls.add(response.urljoin((href or "").strip()))
+            finally:
+                await page.close()
 
         cards = response.css(
             "div[id^='df-result-products-'], div.dfd-card, div.dfd-card-live, div[data-dfd-role='card']"
@@ -180,81 +194,104 @@ class GoforgreenukSpider(scrapy.Spider):
                 },
             )
 
-        # Fallback: some result pages render with different classes but still expose direct product anchors.
-        if discovered == 0:
-            for anchor in response.css("a[href]"):
-                href = (anchor.attrib.get("href") or "").strip()
-                if not href:
-                    continue
-                product_url = response.urljoin(href)
-                if not self._looks_like_product_url(product_url):
-                    continue
-                if product_url in self._seen_product_urls:
-                    continue
+        # Fallback: result pages may expose additional products via generic anchors and JS blobs.
+        for anchor in response.css("a[href]"):
+            href = (anchor.attrib.get("href") or "").strip()
+            if not href:
+                continue
+            product_url = response.urljoin(href)
+            if not self._looks_like_product_url(product_url):
+                continue
+            if product_url in self._seen_product_urls:
+                continue
 
-                self._seen_product_urls.add(product_url)
-                discovered += 1
+            self._seen_product_urls.add(product_url)
+            discovered += 1
 
-                listing_title = self._clean_text(
-                    " ".join(
-                        anchor.css("::text").getall()
-                    )
-                )
-                if not listing_title:
-                    listing_title = self._clean_text(anchor.attrib.get("title", ""))
+            listing_title = self._clean_text(" ".join(anchor.css("::text").getall()))
+            if not listing_title:
+                listing_title = self._clean_text(anchor.attrib.get("title", ""))
 
-                yield scrapy.Request(
-                    url=product_url,
-                    callback=self.parse_product,
-                    errback=self.errback_request,
-                    meta={
-                        "listing_title": listing_title,
-                        "listing_desc": "",
-                        "listing_price": "",
-                        "listing_image": "",
-                        "search_url": response.url,
-                        "playwright": True,
-                        "playwright_include_page": True,
-                        "playwright_page_methods": [
-                            PageMethod("wait_for_timeout", 1200),
-                        ],
-                    },
-                )
-
-        if discovered == 0:
-            regex_urls = set(
-                re.findall(
-                    r"https?://www\.goforgreenuk\.com/[a-z0-9\-]+-(?:[a-z]{0,3}v\d+[a-z0-9\-]*)",
-                    response.text.lower(),
-                )
+            yield scrapy.Request(
+                url=product_url,
+                callback=self.parse_product,
+                errback=self.errback_request,
+                meta={
+                    "listing_title": listing_title,
+                    "listing_desc": "",
+                    "listing_price": "",
+                    "listing_image": "",
+                    "search_url": response.url,
+                    "playwright": True,
+                    "playwright_include_page": True,
+                    "playwright_page_methods": [
+                        PageMethod("wait_for_timeout", 1200),
+                    ],
+                },
             )
-            for product_url in regex_urls:
-                product_url = response.urljoin(product_url)
-                if product_url in self._seen_product_urls:
-                    continue
-                if not self._looks_like_product_url(product_url):
-                    continue
 
-                self._seen_product_urls.add(product_url)
-                discovered += 1
+        # Playwright frame-aware extraction catches links that do not end up in response.css.
+        for product_url in page_anchor_urls:
+            if not self._looks_like_product_url(product_url):
+                continue
+            if product_url in self._seen_product_urls:
+                continue
 
-                yield scrapy.Request(
-                    url=product_url,
-                    callback=self.parse_product,
-                    errback=self.errback_request,
-                    meta={
-                        "listing_title": "",
-                        "listing_desc": "",
-                        "listing_price": "",
-                        "listing_image": "",
-                        "search_url": response.url,
-                        "playwright": True,
-                        "playwright_include_page": True,
-                        "playwright_page_methods": [
-                            PageMethod("wait_for_timeout", 1200),
-                        ],
-                    },
-                )
+            self._seen_product_urls.add(product_url)
+            discovered += 1
+
+            yield scrapy.Request(
+                url=product_url,
+                callback=self.parse_product,
+                errback=self.errback_request,
+                meta={
+                    "listing_title": "",
+                    "listing_desc": "",
+                    "listing_price": "",
+                    "listing_image": "",
+                    "search_url": response.url,
+                    "playwright": True,
+                    "playwright_include_page": True,
+                    "playwright_page_methods": [
+                        PageMethod("wait_for_timeout", 1200),
+                    ],
+                },
+            )
+
+        # Some product URLs are present in JS payloads but not rendered as anchor tags.
+        regex_urls = set(
+            re.findall(
+                r"https?://www\.goforgreenuk\.com/[a-z0-9\-/]+",
+                response.text.lower(),
+            )
+        )
+        for product_url in regex_urls:
+            product_url = response.urljoin(product_url)
+            if product_url in self._seen_product_urls:
+                continue
+            if not self._looks_like_product_url(product_url):
+                continue
+
+            self._seen_product_urls.add(product_url)
+            discovered += 1
+
+            yield scrapy.Request(
+                url=product_url,
+                callback=self.parse_product,
+                errback=self.errback_request,
+                meta={
+                    "listing_title": "",
+                    "listing_desc": "",
+                    "listing_price": "",
+                    "listing_image": "",
+                    "search_url": response.url,
+                    "playwright": True,
+                    "playwright_include_page": True,
+                    "playwright_page_methods": [
+                        PageMethod("wait_for_timeout", 1200),
+                    ],
+                },
+            )
 
         self.logger.info("Discovered %s product URLs from %s", discovered, response.url)
 

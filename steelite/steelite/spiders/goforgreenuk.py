@@ -1,16 +1,31 @@
+import json
 import re
+from urllib.parse import urlencode
 
 import scrapy
-from scrapy_playwright.page import PageMethod
 
 
 class GoforgreenukSpider(scrapy.Spider):
     name = "goforgreenuk"
-    allowed_domains = ["www.goforgreenuk.com"]
-    start_urls = [
-        "https://www.goforgreenuk.com/search/products?keywords=steelite",
-        "https://www.goforgreenuk.com/search/products?keywords=steelite&search=products",
+    allowed_domains = ["www.goforgreenuk.com", "eu1-search.doofinder.com"]
+
+    # Doofinder search API — discovered from the site's JS search widget.
+    _DOOFINDER_API = "https://eu1-search.doofinder.com/5/search"
+    _DOOFINDER_HASHID = "baeda13069f4a0d7caf0dfdaf0aa8752"
+
+    _PRICE_RANGES = [
+        (None, None),
+        (0, 5),
+        (5, 15),
+        (15, 30),
+        (30, 50),
+        (50, 80),
+        (80, 120),
+        (120, 200),
+        (200, 400),
+        (400, 3000),
     ]
+
     custom_settings = {
         "ROBOTSTXT_OBEY": False,
         "HTTPERROR_ALLOWED_CODES": [403, 404, 429],
@@ -21,8 +36,8 @@ class GoforgreenukSpider(scrapy.Spider):
             "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
         },
         "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
-        "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
-        "DOWNLOAD_DELAY": 1.0,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_DELAY": 0.5,
         "DEFAULT_REQUEST_HEADERS": {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
@@ -34,7 +49,6 @@ class GoforgreenukSpider(scrapy.Spider):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._seen_product_urls = set()
-        self._seen_listing_urls = set()
 
     @staticmethod
     def _clean_text(value):
@@ -66,12 +80,47 @@ class GoforgreenukSpider(scrapy.Spider):
 
     @staticmethod
     def _extract_catalog_number(name, url, body_text):
+        primary_sources = (name, url)
+        secondary_sources = (body_text,)
+
+        for source in primary_sources:
+            if not source:
+                continue
+            match = re.search(r"\b(VV\d{3,}[A-Z0-9]*)\b", str(source).upper())
+            if match:
+                return match.group(1)
+
+        for source in primary_sources:
+            if not source:
+                continue
+            match = re.search(r"\b(V\d{4,}[A-Z0-9]*)\b", str(source).upper())
+            if match:
+                return match.group(1)
+
+        for source in secondary_sources:
+            if not source:
+                continue
+            match = re.search(r"\b(VV\d{3,}[A-Z0-9]*)\b", str(source).upper())
+            if match:
+                return match.group(1)
+
+        for source in secondary_sources:
+            if not source:
+                continue
+            match = re.search(r"\b(V\d{4,}[A-Z0-9]*)\b", str(source).upper())
+            if match:
+                return match.group(1)
+
         for source in (name, url, body_text):
             if not source:
                 continue
-            match = re.search(r"\b([A-Z]{0,3}\d{3,}[A-Z0-9]*)\b", str(source).upper())
+            src_upper = str(source).upper()
+            match = re.search(r"\b([A-Z]{2,}\d{3,}[A-Z0-9]*)\b", src_upper)
             if match:
-                return match.group(1)
+                val = match.group(1)
+                if re.fullmatch(r"\d+MM", val) or re.fullmatch(r"\d+X\d+MM", val):
+                    continue
+                return val
         return ""
 
     @staticmethod
@@ -84,237 +133,121 @@ class GoforgreenukSpider(scrapy.Spider):
         return raw
 
     @staticmethod
-    def _looks_like_product_url(url):
-        if not url:
-            return False
-        lower = url.lower()
-        if any(token in lower for token in ["/account", "/blog", "/contact", "/wishlist", "/checkout", "/search", "/shop-by-brand"]):
-            return False
-        if lower.endswith(".jpg") or lower.endswith(".png") or lower.endswith(".svg"):
-            return False
-        # Typical product URL pattern on this site includes a sku token at the end, e.g. -vv469 or -v0163.
-        if re.search(r"-[a-z]{0,2}v\d{2,}[a-z0-9-]*$", lower):
-            return True
-        return "/steelite-" in lower and lower.count("-") >= 2
+    def _api_scalar(value):
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value).strip()
+        if isinstance(value, list):
+            parts = [GoforgreenukSpider._api_scalar(part) for part in value]
+            return " ".join(part for part in parts if part).strip()
+        if isinstance(value, dict):
+            for key in ("value", "text", "label", "name", "id"):
+                candidate = value.get(key)
+                if candidate not in (None, ""):
+                    return GoforgreenukSpider._api_scalar(candidate)
+            parts = [GoforgreenukSpider._api_scalar(part) for part in value.values()]
+            return " ".join(part for part in parts if part).strip()
+        return str(value).strip()
 
-    def start_requests(self):
-        for url in self.start_urls:
-            self._seen_listing_urls.add(url)
+
+    def _api_url(self, page, price_lo=None, price_hi=None):
+        params = {
+            "hashid": self._DOOFINDER_HASHID,
+            "query": "steelite",
+            "page": page,
+            "rpp": 100,
+        }
+        if price_lo is not None:
+            params["filter[best_price][gte]"] = price_lo
+            params["filter[best_price][lt]"] = price_hi
+        return f"{self._DOOFINDER_API}?{urlencode(params)}"
+
+    def _initial_requests(self):
+        api_headers = {
+            "Accept": "application/json",
+            "Referer": "https://www.goforgreenuk.com/",
+            "Origin": "https://www.goforgreenuk.com",
+        }
+        for lo, hi in self._PRICE_RANGES:
+            url = self._api_url(1, lo, hi)
             yield scrapy.Request(
                 url=url,
-                callback=self.parse_search,
+                callback=self.parse_api_page,
                 errback=self.errback_request,
-                meta={
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 3000),
-                        PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                        PageMethod("wait_for_timeout", 2000),
-                        PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                        PageMethod("wait_for_timeout", 2000),
-                        PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                        PageMethod("wait_for_timeout", 2000),
-                        PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                        PageMethod("wait_for_timeout", 2000),
-                        PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                        PageMethod("wait_for_timeout", 2000),
-                    ],
-                },
+                meta={"price_lo": lo, "price_hi": hi, "api_page": 1},
                 dont_filter=True,
+                headers=api_headers,
             )
 
-    async def parse_search(self, response):
-        page = response.meta.get("playwright_page")
-        page_anchor_urls = set()
-        if page:
-            try:
-                # Doofinder may render links in dynamic frames not visible in response.css.
-                for frame in page.frames:
-                    try:
-                        hrefs = await frame.eval_on_selector_all(
-                            "a[href]",
-                            "elements => elements.map(e => e.href || e.getAttribute('href') || '').filter(Boolean)",
-                        )
-                    except Exception:
-                        hrefs = []
-                    for href in hrefs or []:
-                        page_anchor_urls.add(response.urljoin((href or "").strip()))
-            finally:
-                await page.close()
+    async def start(self):
+        for request in self._initial_requests():
+            yield request
 
-        cards = response.css(
-            "div[id^='df-result-products-'], div.dfd-card, div.dfd-card-live, div[data-dfd-role='card']"
+    def parse_api_page(self, response):
+        try:
+            data = json.loads(response.text)
+        except Exception as exc:
+            self.logger.error("Failed to parse Doofinder API response from %s: %s", response.url, exc)
+            return
+
+        results = data.get("results", [])
+        price_lo = response.meta.get("price_lo")
+        price_hi = response.meta.get("price_hi")
+        api_page = response.meta.get("api_page", 1)
+        self.logger.info(
+            "API page=%s price=%s-%s → %s results (total_found=%s)",
+            api_page, price_lo, price_hi, len(results), data.get("total_found"),
         )
-        discovered = 0
 
-        if not cards:
-            self.logger.warning("No listing cards found at %s; using anchor fallback", response.url)
-
-        for card in cards:
-            product_url = (
-                card.css("a.dfd-card-link::attr(href)").get(default="").strip()
-                or card.css("::attr(dfd-value-link)").get(default="").strip()
-                or card.css("a[href*='goforgreenuk.com']::attr(href)").get(default="").strip()
-            )
-
-            if not product_url:
+        for item in results:
+            link = self._api_scalar(item.get("link"))
+            if not link:
                 continue
+            if link.startswith("http"):
+                product_url = link
+            else:
+                product_url = f"https://www.goforgreenuk.com{link}"
 
-            product_url = response.urljoin(product_url)
             if product_url in self._seen_product_urls:
                 continue
             self._seen_product_urls.add(product_url)
-            discovered += 1
-
-            listing_title = self._clean_text(" ".join(card.css(".dfd-card-title *::text").getall()))
-            listing_desc = self._clean_text(" ".join(card.css(".dfd-card-description *::text").getall()))
-            listing_price = self._clean_text(" ".join(card.css(".dfd-card-price *::text").getall()))
-            listing_image = self._clean_image(
-                card.css(".dfd-card-thumbnail img::attr(src), img::attr(src)").get(default="")
-            )
-            if listing_image:
-                listing_image = response.urljoin(listing_image)
 
             yield scrapy.Request(
                 url=product_url,
                 callback=self.parse_product,
                 errback=self.errback_request,
                 meta={
-                    "listing_title": listing_title,
-                    "listing_desc": listing_desc,
-                    "listing_price": listing_price,
-                    "listing_image": listing_image,
+                    "listing_title": self._api_scalar(item.get("title")),
+                    "listing_desc": self._api_scalar(item.get("description")),
+                    "listing_price": self._api_scalar(item.get("price") or item.get("best_price")),
+                    "listing_image": self._api_scalar(item.get("image_link")),
+                    "listing_sku": self._api_scalar(item.get("c:sku") or item.get("mpn")),
+                    "listing_gtin": self._api_scalar(item.get("gtin")),
+                    "listing_color": self._api_scalar(item.get("g:color")),
+                    "listing_material": self._api_scalar(item.get("g:material")),
+                    "listing_pattern": self._api_scalar(item.get("g:pattern")),
                     "search_url": response.url,
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 1200),
-                    ],
                 },
             )
 
-        # Fallback: result pages may expose additional products via generic anchors and JS blobs.
-        for anchor in response.css("a[href]"):
-            href = (anchor.attrib.get("href") or "").strip()
-            if not href:
-                continue
-            product_url = response.urljoin(href)
-            if not self._looks_like_product_url(product_url):
-                continue
-            if product_url in self._seen_product_urls:
-                continue
-
-            self._seen_product_urls.add(product_url)
-            discovered += 1
-
-            listing_title = self._clean_text(" ".join(anchor.css("::text").getall()))
-            if not listing_title:
-                listing_title = self._clean_text(anchor.attrib.get("title", ""))
-
-            yield scrapy.Request(
-                url=product_url,
-                callback=self.parse_product,
-                errback=self.errback_request,
-                meta={
-                    "listing_title": listing_title,
-                    "listing_desc": "",
-                    "listing_price": "",
-                    "listing_image": "",
-                    "search_url": response.url,
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 1200),
-                    ],
-                },
-            )
-
-        # Playwright frame-aware extraction catches links that do not end up in response.css.
-        for product_url in page_anchor_urls:
-            if not self._looks_like_product_url(product_url):
-                continue
-            if product_url in self._seen_product_urls:
-                continue
-
-            self._seen_product_urls.add(product_url)
-            discovered += 1
-
-            yield scrapy.Request(
-                url=product_url,
-                callback=self.parse_product,
-                errback=self.errback_request,
-                meta={
-                    "listing_title": "",
-                    "listing_desc": "",
-                    "listing_price": "",
-                    "listing_image": "",
-                    "search_url": response.url,
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 1200),
-                    ],
-                },
-            )
-
-        # Some product URLs are present in JS payloads but not rendered as anchor tags.
-        regex_urls = set(
-            re.findall(
-                r"https?://www\.goforgreenuk\.com/[a-z0-9\-/]+",
-                response.text.lower(),
-            )
-        )
-        for product_url in regex_urls:
-            product_url = response.urljoin(product_url)
-            if product_url in self._seen_product_urls:
-                continue
-            if not self._looks_like_product_url(product_url):
-                continue
-
-            self._seen_product_urls.add(product_url)
-            discovered += 1
-
-            yield scrapy.Request(
-                url=product_url,
-                callback=self.parse_product,
-                errback=self.errback_request,
-                meta={
-                    "listing_title": "",
-                    "listing_desc": "",
-                    "listing_price": "",
-                    "listing_image": "",
-                    "search_url": response.url,
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 1200),
-                    ],
-                },
-            )
-
-        self.logger.info("Discovered %s product URLs from %s", discovered, response.url)
-
-        next_links = response.css(
-            "a[rel='next']::attr(href), a.next::attr(href), .pagination a[aria-label*='Next']::attr(href)"
-        ).getall()
-        for href in next_links:
-            next_url = response.urljoin((href or "").strip())
-            if not next_url or next_url in self._seen_listing_urls:
-                continue
-            self._seen_listing_urls.add(next_url)
+        # Paginate within this price bucket.  The Doofinder API hard-caps at page 10 (1000 items).
+        total_found = data.get("total_found", 0)
+        if api_page * 100 < min(total_found, 1000):
+            next_page = api_page + 1
+            next_url = self._api_url(next_page, price_lo, price_hi)
             yield scrapy.Request(
                 url=next_url,
-                callback=self.parse_search,
+                callback=self.parse_api_page,
                 errback=self.errback_request,
-                meta={
-                    "playwright": True,
-                    "playwright_include_page": True,
-                    "playwright_page_methods": [
-                        PageMethod("wait_for_timeout", 1500),
-                        PageMethod("evaluate", "window.scrollTo(0, document.body.scrollHeight)"),
-                        PageMethod("wait_for_timeout", 1200),
-                    ],
+                meta={"price_lo": price_lo, "price_hi": price_hi, "api_page": next_page},
+                dont_filter=True,
+                headers={
+                    "Accept": "application/json",
+                    "Referer": "https://www.goforgreenuk.com/",
+                    "Origin": "https://www.goforgreenuk.com",
                 },
             )
 
@@ -328,6 +261,11 @@ class GoforgreenukSpider(scrapy.Spider):
         listing_price = response.meta.get("listing_price", "")
         listing_image = response.meta.get("listing_image", "")
         search_url = response.meta.get("search_url", "")
+        listing_sku = response.meta.get("listing_sku", "")
+        listing_gtin = response.meta.get("listing_gtin", "")
+        listing_color = response.meta.get("listing_color", "")
+        listing_material = response.meta.get("listing_material", "")
+        listing_pattern = response.meta.get("listing_pattern", "")
 
         product_name = self._clean_text(" ".join(response.css("h1 *::text").getall()))
         if not product_name:
@@ -379,13 +317,40 @@ class GoforgreenukSpider(scrapy.Spider):
         material = self._extract_first(specs, ["material", "prod material", "product material"])
         pattern = self._extract_first(specs, ["pattern", "range", "collection"])
 
+        # Extract MPN and GTIN from the structured code block (highest priority, page-level)
+        mpn = ""
+        gtin_from_page = ""
+        for span_text in response.css("span.gfg-add-code::text").getall():
+            text = span_text.strip()
+            upper = text.upper()
+            if upper.startswith("MPN:"):
+                mpn = text[4:].strip()
+            elif upper.startswith("GTIN:"):
+                gtin_from_page = text[5:].strip()
+        if not mpn and listing_sku:
+            mpn = listing_sku
+
         ean_code = self._extract_first(specs, ["ean", "ean code", "gtin", "upc"])
         barcode = self._extract_first(specs, ["barcode", "upc", "gtin", "ean"])
 
+        if not ean_code and gtin_from_page:
+            ean_code = gtin_from_page
         if not ean_code:
             ean_code = self._extract_from_text(r"\b(?:GTIN|EAN)\s*:\s*([0-9]{8,14})\b", details_blob)
+        if not ean_code and listing_gtin:
+            ean_code = listing_gtin
+
         if not barcode:
             barcode = self._extract_from_text(r"\b(?:Barcode|UPC|MPN|Code)\s*:\s*([A-Z0-9\-]+)\b", details_blob)
+        if not barcode and listing_sku:
+            barcode = listing_sku
+
+        if not color and listing_color:
+            color = listing_color
+        if not material and listing_material:
+            material = listing_material
+        if not pattern and listing_pattern:
+            pattern = listing_pattern
 
         combined = f"{product_name} {overview}"
         if not diameter:
@@ -398,9 +363,12 @@ class GoforgreenukSpider(scrapy.Spider):
                     volume = f"{volume} {unit}"
 
         catalog_number = self._extract_catalog_number(product_name, response.url, details_blob)
+        if not catalog_number and listing_sku:
+            catalog_number = listing_sku
 
         yield {
             "catalog_number": catalog_number,
+            "mpn": mpn,
             "product_name": product_name,
             "product_url": response.url,
             "search_url": search_url,

@@ -23,7 +23,7 @@ class WasserstromV01Spider(scrapy.Spider):
     def __init__(self, max_pages=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Allow limiting the number of pages to scrape (for testing)
-        self.max_pages = int(max_pages) if max_pages else 35
+        self.max_pages = int(max_pages) if max_pages else 120
         self._seen_product_urls = set()
         self.logger.info(f"Will scrape up to {self.max_pages} pages of STEELITE products")
 
@@ -284,9 +284,7 @@ class WasserstromV01Spider(scrapy.Spider):
 
         self.logger.info(f"Page {page_number}: {new_count} new products, {duplicate_count} duplicates")
 
-        # Continue while we still receive full pages, respecting discovered/explicit page caps.
-        has_more_by_size = len(unique_products) >= page_size
-        has_next = page_number < effective_max_pages and has_more_by_size
+        has_next = page_number < effective_max_pages
 
         if has_next:
             next_begin_index = begin_index + page_size

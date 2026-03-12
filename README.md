@@ -1,6 +1,6 @@
-# Scrapy Web Scraping — Steelite/Utopia Products
+# Scrapy Web Scraping STEELITE
 
-A Scrapy-based pipeline for scraping Steelite and Utopia product data from multiple retailer websites and populating a master Excel spreadsheet (`sources/STEELITE.xlsx`).
+A Scrapy-based pipeline for scraping Steelite product data from multiple retailer websites and populating a master Excel spreadsheet (`sources/STEELITE.xlsx`).
 
 ---
 
